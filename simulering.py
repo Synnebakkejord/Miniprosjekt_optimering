@@ -7,177 +7,228 @@ import math
 
 plt.style.use('ggplot')
 
-# Leser input-data fra Excel
-input_fil = pd.read_excel('Input miniprosjekt.xlsx', sheet_name='Sheet1')
+# ── Configuration ──────────────────────────────────────────────────────────────
+INPUT_FILE        = 'Input miniprosjekt.xlsx'
+NUM_REPLICATIONS  = 20
+NUM_WEEKS         = 5
+WARMUP_WEEKS      = 1
+NUM_PATIENT_TYPES = 3   # 0 = red (most urgent), 1 = yellow, 2 = green
 
-# Parametere
-Runs = 100
-Weeks = 5
-Warm_up = 1
-Num_of_pat = 3
+NUM_TRIAGE_BEDS = 10
+NUM_NURSES      = 5
+NUM_DOCTORS     = 5
 
-# Ressurskapasiteter
-Num_sykepleiere = 5
-Num_leger = 5
-Num_triagesenger = 10
+TRIAGE_MEAN_MIN = 10    # mean triage duration (minutes)
+DOCTOR_MEAN_MIN = 60    # mean diagnostics duration (minutes)
+TRIAGE_RATE     = 1 / TRIAGE_MEAN_MIN
+DOCTOR_RATE     = 1 / DOCTOR_MEAN_MIN
 
-# Betjeningstider
-lambda_triage = 1/10
-lambda_lege = 1/60
+RANDOM_SEED         = 10
+PATIENT_TYPE_NAMES  = ['Red (urgent)', 'Yellow', 'Green']
+WARMUP_MINUTES      = WARMUP_WEEKS * 7 * 24 * 60
 
-# Leser lambda fra Excel
-Lambda = input_fil['Lambda'].values
+# ── Load and reshape arrival rates from Excel ──────────────────────────────────
+# arrival_rates[patient_type, day_of_week, hour_of_day]
+input_data     = pd.read_excel(INPUT_FILE, sheet_name='Sheet1')
+arrival_rates  = input_data['Lambda'].values.reshape(NUM_PATIENT_TYPES, 7, 24)
 
-# Bygger lambda-tabell
-Lambda_table = np.zeros((Num_of_pat, 7, 24))
-teller = 0
-for p in range(Num_of_pat):
-    for d in range(7):
-        for h in range(24):
-            Lambda_table[p, d, h] = Lambda[teller]
-            teller += 1
+# Maximum rate per type — used for the thinning (rejection-sampling) algorithm
+max_rate_per_type = arrival_rates.reshape(NUM_PATIENT_TYPES, -1).max(axis=1)
 
-# Beregner Lambda_max automatisk
-Lambda_max = np.zeros(Num_of_pat)
-for p in range(Num_of_pat):
-    Lambda_max[p] = np.max(Lambda_table[p])
+# ── Results storage ────────────────────────────────────────────────────────────
+# Waiting time to triage (post warm-up)
+triage_waits      = [[] for _ in range(NUM_REPLICATIONS)]
+triage_waits_type = [[[] for _ in range(NUM_PATIENT_TYPES)]
+                     for _ in range(NUM_REPLICATIONS)]
 
-# Datainnsamling
-WT_triage = [[] for _ in range(Runs)]
-WT_triage_type = [[[] for _ in range(3)] for _ in range(Runs)]
-WT_lege = [[] for _ in range(Runs)]
-WT_lege_type = [[[] for _ in range(3)] for _ in range(Runs)]
-Senger_out = np.zeros((Runs, 7, 24))
-Senger_count = np.zeros((Runs, 7, 24))
+# Waiting time for doctor (post warm-up)
+doctor_waits      = [[] for _ in range(NUM_REPLICATIONS)]
+doctor_waits_type = [[[] for _ in range(NUM_PATIENT_TYPES)]
+                     for _ in range(NUM_REPLICATIONS)]
 
-# Pasientklasse
+# Emergency bed occupancy — sampled at each bed-entry and bed-exit event
+# (post warm-up). Shape: (replications, day_of_week, hour_of_day)
+bed_occ_sum   = np.zeros((NUM_REPLICATIONS, 7, 24))
+bed_occ_count = np.zeros((NUM_REPLICATIONS, 7, 24))
+
+# ── Patient class ──────────────────────────────────────────────────────────────
 class Patient:
-    def __init__(self, env1, number, hastegrad, behandlingstid):
-        self.env1 = env1
-        self.number = number
-        self.hastegrad = hastegrad
-        self.behandlingstid = behandlingstid
+    """A single patient visiting the emergency department."""
+    def __init__(self, patient_id: int, patient_type: int):
+        self.patient_id   = patient_id
+        self.patient_type = patient_type   # 0=red, 1=yellow, 2=green
 
-# Ankomstfunksjon
-def arrival(env1, weeks, lambda_time, num_of_pat):
-    pat_count = 0
-    next_arrivals = np.zeros(num_of_pat)
-    next_arrival = 0
+# ── Helper functions ───────────────────────────────────────────────────────────
+def in_steady_state(env) -> bool:
+    return env.now >= WARMUP_MINUTES
 
-    while next_arrival < 60 * 24 * 7 * weeks:
-        time = env1.now
-        next_arrival = np.min(next_arrivals)
+def record_bed_occupancy(env, run_idx: int, current_count: int):
+    """Snapshot the current emergency bed count at this simulation time."""
+    if not in_steady_state(env):
+        return
+    t    = env.now
+    day  = int((t // (60 * 24)) % 7)
+    hour = int((t // 60) % 24)
+    bed_occ_sum[run_idx, day, hour]   += current_count
+    bed_occ_count[run_idx, day, hour] += 1
 
-        for jj in range(len(next_arrivals)):
-            if next_arrivals[jj] == next_arrival:
-                break
+# ── Patient process ────────────────────────────────────────────────────────────
+def patient_process(env, patient: Patient, run_idx: int,
+                    triage_beds, nurses, doctors):
+    global emergency_beds_occupied
 
-        dur_behandling_pat = random.expovariate(lambda_lege)
+    # Stage 1 — Triage: needs a triage bed AND a nurse at the same time
+    entered_triage_queue = env.now
 
-        pat = Patient(env1, 'Patient %01d' % pat_count, jj, dur_behandling_pat)
-        send_to_ed = ed(env1, patient=pat, run_nr=k)
-        env1.process(send_to_ed)
+    with triage_beds.request() as req_bed, nurses.request() as req_nurse:
+        yield req_bed & req_nurse
 
-        accept = 0
-        time_count_test = next_arrival
-        while accept == 0 and time_count_test < 60 * 24 * 7 * weeks:
-            waiting_time = random.expovariate(Lambda_max[jj])
-            time_count_test += waiting_time
-            day = math.floor((time_count_test / (24 * 60)) % 7)
-            hour = math.floor((time_count_test / 60) % 24)
-            u = random.uniform(0, 1)
-            if time_count_test < 60 * 24 * 7 * weeks and u <= lambda_time[jj][day][hour] / Lambda_max[jj]:
-                accept = 1
-                pat_count += 1
+        triage_wait = env.now - entered_triage_queue
+        if in_steady_state(env):
+            triage_waits[run_idx].append(triage_wait)
+            triage_waits_type[run_idx][patient.patient_type].append(triage_wait)
 
-        next_arrivals[jj] = time_count_test
-        next_pat_arrival = np.min(next_arrivals)
-        yield env1.timeout(next_pat_arrival - next_arrival)
+        yield env.timeout(random.expovariate(TRIAGE_RATE))
+    # Triage bed and nurse are released here
 
-# Pasientprosess
-def ed(env1, patient, run_nr):
-    global pasienter_i_systemet
+    # Stage 2 — Emergency bed (held until departure) + Doctor visit
+    emergency_beds_occupied += 1
+    record_bed_occupancy(env, run_idx, emergency_beds_occupied)
 
-    arrive = env1.now
-    triage_arrive = arrive
-    pasienter_i_systemet += 1
+    entered_doctor_queue = env.now
 
-    # Logg sengebelegg (kun etter oppvarming)
-    week = int(math.floor((arrive / (24 * 60 * 7))))
-    if week >= Warm_up:
-        day = int(math.floor((arrive / (24 * 60)) % 7))
-        hour = int(math.floor((arrive / 60) % 24))
-        Senger_out[run_nr, day, hour] += pasienter_i_systemet
-        Senger_count[run_nr, day, hour] += 1
+    with doctors.request(priority=patient.patient_type) as req_doctor:
+        yield req_doctor
 
-    with resources[0].request() as req_seng, resources[1].request() as req_syk:
-        yield req_seng & req_syk
+        doctor_wait = env.now - entered_doctor_queue
+        if in_steady_state(env):
+            doctor_waits[run_idx].append(doctor_wait)
+            doctor_waits_type[run_idx][patient.patient_type].append(doctor_wait)
 
-        triage_start = env1.now
-        ventetid_triage = triage_start - triage_arrive
-        WT_triage[run_nr].append(ventetid_triage)
-        WT_triage_type[run_nr][patient.hastegrad].append(ventetid_triage)
+        yield env.timeout(random.expovariate(DOCTOR_RATE))
 
-        yield env1.timeout(random.expovariate(lambda_triage))
+    # Patient departs — release the emergency bed
+    emergency_beds_occupied -= 1
+    record_bed_occupancy(env, run_idx, emergency_beds_occupied)
 
-    lege_arrive = env1.now
-    with resources[2].request(priority=patient.hastegrad) as req_lege:
-        yield req_lege
+# ── Arrival process — non-homogeneous Poisson via thinning ────────────────────
+def arrival_process(env, num_weeks: int, run_idx: int,
+                    triage_beds, nurses, doctors):
+    """
+    Generates arrivals using the thinning (Lewis-Shedler) algorithm.
+    Each patient type is tracked independently; the earliest next arrival
+    across all types is processed first.
+    """
+    sim_end       = 60 * 24 * 7 * num_weeks
+    patient_count = 0
 
-        lege_start = env1.now
-        ventetid_lege = lege_start - lege_arrive
-        WT_lege[run_nr].append(ventetid_lege)
-        WT_lege_type[run_nr][patient.hastegrad].append(ventetid_lege)
+    # Next scheduled arrival time per patient type
+    next_arrival_per_type = np.zeros(NUM_PATIENT_TYPES)
 
-        yield env1.timeout(random.expovariate(lambda_lege))
+    while True:
+        current_time = np.min(next_arrival_per_type)
+        if current_time >= sim_end:
+            break
 
-    pasienter_i_systemet -= 1
+        # Find the type with the earliest next arrival
+        patient_type = int(np.argmin(next_arrival_per_type))
 
-# Hovedløkke
-Random_seed = 10
+        # Dispatch this patient at the current simulation time
+        patient = Patient(patient_count, patient_type)
+        env.process(patient_process(env, patient, run_idx,
+                                    triage_beds, nurses, doctors))
+        patient_count += 1
 
-for k in range(Runs):
-    print('Start simulating replication number: ', k)
-    pasienter_i_systemet = 0
+        # Thinning: find the next accepted arrival for this patient type
+        t        = current_time
+        accepted = False
+        while not accepted and t < sim_end:
+            t   += random.expovariate(max_rate_per_type[patient_type])
+            day  = int((t // (60 * 24)) % 7)
+            hour = int((t // 60) % 24)
+            rate = arrival_rates[patient_type, day, hour]
+            if t < sim_end and random.random() <= rate / max_rate_per_type[patient_type]:
+                accepted = True
 
-    random.seed(Random_seed + k)
+        next_arrival_per_type[patient_type] = t if accepted else sim_end
+
+        # Advance clock to the next soonest arrival across all types
+        yield env.timeout(np.min(next_arrival_per_type) - current_time)
+
+# ── Main simulation loop ───────────────────────────────────────────────────────
+for run in range(NUM_REPLICATIONS):
+    print(f'Replication {run + 1} / {NUM_REPLICATIONS}')
+    emergency_beds_occupied = 0
+
+    random.seed(RANDOM_SEED + run)
     env = simpy.Environment()
 
-    Triageseng = simpy.Resource(env, capacity=Num_triagesenger)
-    Sykepleier = simpy.Resource(env, capacity=Num_sykepleiere)
-    Lege = simpy.PriorityResource(env, capacity=Num_leger)
+    triage_beds = simpy.Resource(env, capacity=NUM_TRIAGE_BEDS)
+    nurses      = simpy.Resource(env, capacity=NUM_NURSES)
+    doctors     = simpy.PriorityResource(env, capacity=NUM_DOCTORS)
 
-    resources = [Triageseng, Sykepleier, Lege]
-
-    env.process(arrival(env, Weeks, Lambda_table, Num_of_pat))
+    env.process(arrival_process(env, NUM_WEEKS, run, triage_beds, nurses, doctors))
     env.run()
 
-print('Simulering ferdig!')
+print('Simulation complete.\n')
 
-# Beregn gjennomsnittlig sengebelegg per time
-Avg_senger = np.zeros((Runs, 7 * 24))
-for run in range(Runs):
-    for day in range(7):
-        for hour in range(24):
-            if Senger_count[run, day, hour] > 0:
-                Avg_senger[run, day * 24 + hour] = Senger_out[run, day, hour] / Senger_count[run, day, hour]
+# ── Statistics helpers ─────────────────────────────────────────────────────────
+def ci95_halfwidth(values: np.ndarray) -> float:
+    """Half-width of a 95% confidence interval."""
+    return 1.96 * np.std(values, ddof=1) / math.sqrt(len(values))
 
-# Beregn gjennomsnitt og 95% KI
-mean_senger = np.mean(Avg_senger, axis=0)
-std_senger = np.std(Avg_senger, axis=0)
-KI_upper = mean_senger + 1.96 * std_senger / math.sqrt(Runs)
-KI_lower = mean_senger - 1.96 * std_senger / math.sqrt(Runs)
+def print_wait_stats(label: str, wait_lists: list):
+    """
+    Print mean wait, 95th-percentile wait, and 95% CI for both,
+    computed across replications (one value per replication).
+    """
+    run_means = np.array([np.mean(w) for w in wait_lists if w])
+    run_p95   = np.array([np.percentile(w, 95) for w in wait_lists if w])
 
-# Plot
-x_ticks = np.arange(0, 168, 24)
-x_labels = ['Man', 'Tir', 'Ons', 'Tor', 'Fre', 'Lør', 'Søn']
-plt.figure()
-plt.plot(mean_senger, 'k', label='Gjennomsnitt')
-plt.plot(KI_upper, 'k--', label='95% KI øvre')
-plt.plot(KI_lower, 'k--', label='95% KI nedre')
-plt.xlabel('Tid i uka')
-plt.ylabel('Antall senger opptatt')
-plt.title(f'Sengebelegg ({Runs} kjøringer)')
-plt.xticks(x_ticks, x_labels)
+    mean_val = np.mean(run_means);  hw_mean = ci95_halfwidth(run_means)
+    p95_val  = np.mean(run_p95);    hw_p95  = ci95_halfwidth(run_p95)
+
+    print(f'  {label}')
+    print(f'    Mean wait:       {mean_val:6.2f} min   '
+          f'95% CI [{mean_val - hw_mean:.2f}, {mean_val + hw_mean:.2f}]')
+    print(f'    95th percentile: {p95_val:6.2f} min   '
+          f'95% CI [{p95_val - hw_p95:.2f}, {p95_val + hw_p95:.2f}]')
+
+# ── Plot: Emergency bed occupancy ──────────────────────────────────────────────
+avg_beds_per_run = np.zeros((NUM_REPLICATIONS, 7 * 24))
+for run in range(NUM_REPLICATIONS):
+    for d in range(7):
+        for h in range(24):
+            n = bed_occ_count[run, d, h]
+            if n > 0:
+                avg_beds_per_run[run, d * 24 + h] = bed_occ_sum[run, d, h] / n
+
+mean_beds = np.mean(avg_beds_per_run, axis=0)
+std_beds  = np.std(avg_beds_per_run, axis=0, ddof=1)
+ci_upper  = mean_beds + 1.96 * std_beds / math.sqrt(NUM_REPLICATIONS)
+ci_lower  = mean_beds - 1.96 * std_beds / math.sqrt(NUM_REPLICATIONS)
+
+hours      = np.arange(168)
+x_ticks    = np.arange(0, 168, 24)
+day_labels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+
+plt.figure(figsize=(12, 5))
+plt.plot(hours, mean_beds, 'k', label='Mean')
+plt.fill_between(hours, ci_lower, ci_upper, alpha=0.3, color='gray', label='95% CI')
+plt.xlabel('Hour of week')
+plt.ylabel('Emergency beds occupied')
+plt.title(f'Emergency bed occupancy — {NUM_REPLICATIONS} replications')
+plt.xticks(x_ticks, day_labels)
 plt.legend()
+plt.tight_layout()
 plt.show()
+
+# ── Task 3c — Triage waiting time statistics ───────────────────────────────────
+print('=== Task 3c — Triage waiting time (all patients) ===')
+print_wait_stats('All patients', triage_waits)
+
+# ── Task 3d — Doctor waiting time by patient type ──────────────────────────────
+print('\n=== Task 3d — Doctor waiting time by patient type ===')
+for ptype in range(NUM_PATIENT_TYPES):
+    per_run = [doctor_waits_type[run][ptype] for run in range(NUM_REPLICATIONS)]
+    print_wait_stats(PATIENT_TYPE_NAMES[ptype], per_run)
