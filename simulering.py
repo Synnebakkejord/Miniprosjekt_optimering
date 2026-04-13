@@ -7,7 +7,7 @@ import math
 
 plt.style.use('ggplot')
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+# Configuration
 INPUT_FILE        = 'Input miniprosjekt.xlsx'
 NUM_WEEKS         = 5
 WARMUP_WEEKS      = 1
@@ -31,7 +31,9 @@ RANDOM_SEED        = 10
 PATIENT_TYPE_NAMES = ['Red (urgent)', 'Yellow', 'Green']
 WARMUP_MINUTES     = WARMUP_WEEKS * 7 * 24 * 60
 
-# ── Load and reshape arrival rates from Excel ──────────────────────────────────
+
+
+# Load and reshape arrival rates from Excel
 # arrival_rates[patient_type, day_of_week, hour_of_day]
 input_data    = pd.read_excel(INPUT_FILE, sheet_name='Sheet1')
 arrival_rates = input_data['Lambda'].values.reshape(NUM_PATIENT_TYPES, 7, 24)
@@ -39,30 +41,19 @@ arrival_rates = input_data['Lambda'].values.reshape(NUM_PATIENT_TYPES, 7, 24)
 # Maximum rate per type — used for the thinning (rejection-sampling) algorithm
 max_rate_per_type = arrival_rates.reshape(NUM_PATIENT_TYPES, -1).max(axis=1)
 
-# ── Patient class ──────────────────────────────────────────────────────────────
+
+
+# Patient class
 class Patient:
     """A single patient visiting the emergency department."""
     def __init__(self, patient_id: int, patient_type: int):
         self.patient_id   = patient_id
         self.patient_type = patient_type   # 0=red, 1=yellow, 2=green
 
-# ── Patient process ────────────────────────────────────────────────────────────
-def patient_process(env, patient: Patient, run_idx: int,
-                    triage_beds, nurses, doctors,
-                    results: dict, bed_counter: list,
-                    doctor_mean_min: float, blood_test_model: bool):
-    """
-    Simulates one patient's journey through the ED.
+# Patient process 
+def patient_process(env, patient: Patient, run_idx: int, triage_beds, nurses, doctors,
+                    results: dict, bed_counter: list, doctor_mean_min: float, blood_test_model: bool):
 
-    Task 3 flow:
-      Waiting room → triage (bed + nurse) → emergency bed → doctor → depart
-
-    Task 4 flow (blood_test_model=True):
-      Same, but diagnostics is 30 min. After diagnostics, 40% of patients
-      have a blood test drawn, wait for the next hourly lab batch, wait 1h
-      for results, then see a doctor again for a 5-min evaluation before
-      departing. The emergency bed is held throughout.
-    """
     doctor_rate = 1 / doctor_mean_min
 
     # Stage 1 — Triage: needs a triage bed AND a nurse simultaneously
@@ -117,7 +108,6 @@ def patient_process(env, patient: Patient, run_idx: int,
     _record_bed_occupancy(env, run_idx, bed_counter[0], results)
 
 def _record_bed_occupancy(env, run_idx: int, current_count: int, results: dict):
-    """Snapshot the current emergency bed count into the results dict."""
     if env.now < WARMUP_MINUTES:
         return
     t    = env.now
@@ -126,16 +116,10 @@ def _record_bed_occupancy(env, run_idx: int, current_count: int, results: dict):
     results['bed_occ_sum'][run_idx, day, hour]   += current_count
     results['bed_occ_count'][run_idx, day, hour] += 1
 
-# ── Arrival process — non-homogeneous Poisson via thinning ────────────────────
-def arrival_process(env, num_weeks: int, run_idx: int,
-                    triage_beds, nurses, doctors,
-                    results: dict, bed_counter: list,
-                    doctor_mean_min: float, blood_test_model: bool):
-    """
-    Generates arrivals using the thinning (Lewis-Shedler) algorithm.
-    Each patient type is tracked independently; the earliest next arrival
-    across all types is processed first.
-    """
+# Arrival process — non-homogeneous Poisson via thinning
+def arrival_process(env, num_weeks: int, run_idx: int, triage_beds, nurses, doctors,
+                    results: dict, bed_counter: list, doctor_mean_min: float, blood_test_model: bool):
+
     sim_end       = 60 * 24 * 7 * num_weeks
     patient_count = 0
     next_arrival_per_type = np.zeros(NUM_PATIENT_TYPES)
@@ -169,22 +153,10 @@ def arrival_process(env, num_weeks: int, run_idx: int,
 
         yield env.timeout(float(np.min(next_arrival_per_type)) - current_time)
 
-# ── Simulation runner ──────────────────────────────────────────────────────────
-def run_simulation(num_replications: int,
-                   num_doctors: int = NUM_DOCTORS,
-                   doctor_mean_min: float = DOCTOR_MEAN_MIN_T3,
-                   blood_test_model: bool = False) -> dict:
-    """
-    Run the ED simulation for the given number of replications and return
-    all collected results in a dict.
+# Simulation runner
+def run_simulation(num_replications: int, num_doctors: int = NUM_DOCTORS, 
+                   doctor_mean_min: float = DOCTOR_MEAN_MIN_T3, blood_test_model: bool = False) -> dict:
 
-    Parameters
-    ----------
-    num_replications : int
-    num_doctors      : int   — doctor capacity (increase for task 4 stability)
-    doctor_mean_min  : float — mean diagnostics duration (60 for task 3, 30 for task 4)
-    blood_test_model : bool  — enable the task 4 blood test extension
-    """
     results = {
         'num_replications': num_replications,
         'num_doctors':      num_doctors,
@@ -217,7 +189,7 @@ def run_simulation(num_replications: int,
 
     return results
 
-# ── Statistics helpers ─────────────────────────────────────────────────────────
+# Statistics helpers 
 def ci95_halfwidth(values: np.ndarray) -> float:
     """Half-width of a 95% confidence interval (normal approximation)."""
     return float(1.96 * np.std(values, ddof=1) / math.sqrt(len(values)))
@@ -261,9 +233,7 @@ def plot_bed_occupancy(ax, results: dict, title: str):
     ax.set_title(title)
     ax.legend()
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 3 — original model (60 min diagnostics, no blood tests)
-# ══════════════════════════════════════════════════════════════════════════════
 print('── Task 3: Running 20 replications ──')
 results_t3_20 = run_simulation(20, doctor_mean_min=DOCTOR_MEAN_MIN_T3)
 
@@ -291,14 +261,8 @@ for ptype in range(NUM_PATIENT_TYPES):
     per_run = [results_t3_100['doctor_waits_type'][run][ptype] for run in range(100)]
     print_wait_stats(PATIENT_TYPE_NAMES[ptype], per_run)
 
-# ══════════════════════════════════════════════════════════════════════════════
 # Task 4 — blood test extension (30 min diagnostics, 40% blood tests)
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# With blood tests, 40% of patients occupy a doctor twice and hold their
-# emergency bed for ~1-2 hours longer. If the system is unstable with 5 doctors,
-# increase NUM_DOCTORS_T4 by 1 and re-run until steady-state is achieved.
-#
+
 NUM_DOCTORS_T4 = 5   # increase iteratively if system is unstable
 
 print(f'\n── Task 4: Running 100 replications ({NUM_DOCTORS_T4} doctors) ──')
